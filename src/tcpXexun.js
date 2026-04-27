@@ -1,6 +1,22 @@
 import net from "node:net";
 import { decodePacket, splitPackets, hasTrustworthyGps } from "./xexunDecoder.js";
 
+const TZ_CO = "America/Bogota";
+
+/** Misma hora de wall-clock en Colombia (epoch → texto legible, sin tocar el dato en la trama). */
+function formatHoraColombia(date) {
+  return date.toLocaleString("es-CO", {
+    timeZone: TZ_CO,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
 /**
  * Rastreadores Xexun (PO2, etc.): muchos hablan por TCP con tramas 0xFA 0xAF, no por HTTP.
  * Documentación: el servidor a veces debe responder 1 byte (p. ej. 0x00) al recibir;
@@ -50,6 +66,13 @@ function describePacket(dec) {
   } else {
     parts.push("sin coordenadas en trama (revisar máscara / tipo de dato)");
   }
+  if (dec.timestampISO) {
+    const d = new Date(dec.timestampISO);
+    if (!Number.isNaN(d.getTime()) && d.getFullYear() > 2000) {
+      parts.push(`msg_CO=${formatHoraColombia(d)}`);
+    }
+  }
+  parts.push(`rec_CO=${formatHoraColombia(new Date())}`);
   return parts.join(" | ");
 }
 
