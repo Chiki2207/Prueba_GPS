@@ -231,29 +231,62 @@ export function parseXexun2PositionPayload(payload) {
   return result;
 }
 
+/** Lectura plausible antes de fusionar (evita que un último grupo “basura” pise uno bueno). */
+function groupHasPlausibleGps(g) {
+  if (g.lat == null || g.lon == null) return false;
+  if (!Number.isFinite(g.lat) || !Number.isFinite(g.lon)) return false;
+  if (Math.abs(g.lat) < 1e-5 && Math.abs(g.lon) < 1e-5) return false;
+  if (g.satellites != null && g.satellites > 32) return false;
+  if (g.speedKmh != null && g.speedKmh > 280) return false;
+  return true;
+}
+
 function mergeGroupsForLog(groups) {
   /** @type {Record<string, unknown>} */
   const m = {};
-  let lat;
-  let lon;
-  let valid = false;
+  /** @type {{ mcc: number; mnc: number; lac: number; cid: number; signal: number }[]} */
+  const cellsCombined = [];
+  /** @type {{ mac: string; rssi: number }[]} */
+  const wifiCombined = [];
+  const seenCell = new Set();
+
   for (const g of groups) {
-    if (g.lat != null && g.lon != null && Number.isFinite(g.lat) && Number.isFinite(g.lon)) {
-      lat = g.lat;
-      lon = g.lon;
-      valid = !!g.valid;
+    if (g.cells?.length) {
+      for (const c of g.cells) {
+        const k = `${c.mcc}:${c.mnc}:${c.lac}:${c.cid}`;
+        if (seenCell.has(k)) continue;
+        seenCell.add(k);
+        cellsCombined.push(c);
+      }
     }
+    if (g.wifi?.length) wifiCombined.push(...g.wifi);
+
     if (m.timestampISO == null && g.timestampISO) m.timestampISO = g.timestampISO;
     if (m.battery == null && g.battery != null) m.battery = g.battery;
     if (m.charging == null && g.charging != null) m.charging = g.charging;
     if (m.rssi == null && g.rssi != null) m.rssi = g.rssi;
-    if (m.cells == null && g.cells?.length) m.cells = g.cells;
-    if (m.wifi == null && g.wifi?.length) m.wifi = g.wifi;
-    if (m.speedKmh == null && g.speedKmh != null) m.speedKmh = g.speedKmh;
-    if (m.courseDeg == null && g.courseDeg != null) m.courseDeg = g.courseDeg;
-    if (m.altitudeM == null && g.altitudeM != null) m.altitudeM = g.altitudeM;
-    if (m.satellites == null && g.satellites != null) m.satellites = g.satellites;
   }
+
+  if (cellsCombined.length) m.cells = cellsCombined;
+  if (wifiCombined.length) m.wifi = wifiCombined;
+
+  let lat;
+  let lon;
+  let valid = false;
+  for (let gi = groups.length - 1; gi >= 0; gi--) {
+    const g = groups[gi];
+    if (groupHasPlausibleGps(g)) {
+      lat = g.lat;
+      lon = g.lon;
+      valid = !!g.valid;
+      if (g.speedKmh != null) m.speedKmh = g.speedKmh;
+      if (g.courseDeg != null) m.courseDeg = g.courseDeg;
+      if (g.altitudeM != null) m.altitudeM = g.altitudeM;
+      if (g.satellites != null) m.satellites = g.satellites;
+      break;
+    }
+  }
+
   if (lat != null) {
     m.lat = lat;
     m.lon = lon;
@@ -262,9 +295,50 @@ function mergeGroupsForLog(groups) {
   return m;
 }
 
+/**
+ * Descarta lat/lon (y campos derivados) cuando son típicos de “sin fix” o
+ * lectura desalineada (p. ej. satélites > 32, 0° con velocidad alta).
+ */
+function sanitizeMergedGps(m) {
+  if (m.lat == null || m.lon == null) return;
+  const nearZero =
+    Math.abs(m.lat) < 1e-5 && Math.abs(m.lon) < 1e-5;
+  const badSats = m.satellites != null && m.satellites > 32;
+  const insaneSpeed = m.speedKmh != null && m.speedKmh > 280;
+  const incoherent =
+    nearZero && m.speedKmh != null && m.speedKmh > 35;
+
+  if (nearZero || badSats || insaneSpeed || incoherent) {
+    delete m.lat;
+    delete m.lon;
+    delete m.valid;
+    delete m.speedKmh;
+    delete m.courseDeg;
+    delete m.altitudeM;
+    delete m.satellites;
+    if (nearZero) m.gpsRejected = "coords_nulas_sin_fix";
+    else if (badSats) m.gpsRejected = "satelites_imposible_parser";
+    else if (insaneSpeed) m.gpsRejected = "velocidad_imposible";
+    else m.gpsRejected = "coords_vel_incoherentes";
+  }
+}
+
+/** Útil para el servidor TCP: ¿tiene lat/lon creíbles después del saneo? */
+export function hasTrustworthyGps(dec) {
+  return (
+    dec?.lat != null &&
+    dec?.lon != null &&
+    Number.isFinite(dec.lat) &&
+    Number.isFinite(dec.lon) &&
+    !dec.gpsRejected &&
+    (Math.abs(dec.lat) > 1e-5 || Math.abs(dec.lon) > 1e-5)
+  );
+}
+
 function tryDecodePosition(payload) {
   const parsed = parseXexun2PositionPayload(payload);
   const merged = mergeGroupsForLog(parsed.groups);
+  sanitizeMergedGps(merged);
   return {
     ...merged,
     positionGroups: parsed.groups.length,

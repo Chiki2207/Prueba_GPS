@@ -1,5 +1,5 @@
 import net from "node:net";
-import { decodePacket, splitPackets } from "./xexunDecoder.js";
+import { decodePacket, splitPackets, hasTrustworthyGps } from "./xexunDecoder.js";
 
 /**
  * Rastreadores Xexun (PO2, etc.): muchos hablan por TCP con tramas 0xFA 0xAF, no por HTTP.
@@ -19,6 +19,7 @@ function describePacket(dec) {
     `len=${dec.lengthPayload ?? dec.length}`,
   ];
   if (dec.parseError) parts.push(`parse=${dec.parseError}`);
+  if (dec.gpsRejected) parts.push(`GPS=${dec.gpsRejected}`);
   if (dec.timestampISO) parts.push(`ts=${dec.timestampISO}`);
   if (dec.rssi != null) parts.push(`rssi=${dec.rssi}`);
   if (dec.battery != null) {
@@ -32,6 +33,11 @@ function describePacket(dec) {
   if (dec.lat != null && dec.lon != null) {
     parts.push(`lat=${dec.lat.toFixed(6)} lon=${dec.lon.toFixed(6)}`);
     if (dec.valid === false) parts.push("fix=no");
+  } else if (dec.fallbackCells?.length) {
+    const c = dec.fallbackCells[0];
+    parts.push(
+      `ref=LBS de trama previa en mismo TCP MCC=${c.mcc} MNC=${c.mnc} LAC=${c.lac} CID=${c.cid} (no hay GPS fiable en esta trama)`,
+    );
   } else if (dec.cells?.length) {
     const c = dec.cells[0];
     parts.push(
@@ -66,9 +72,14 @@ export function startXexunTcpServer(port, options = {}) {
 
       try {
         const packets = splitPackets(chunk);
+        let lastLbsCells = null;
         for (const p of packets) {
           const dec = decodePacket(p);
           if (!dec) continue;
+          if (dec.cells?.length) lastLbsCells = dec.cells;
+          if (!hasTrustworthyGps(dec) && lastLbsCells?.length) {
+            dec.fallbackCells = lastLbsCells;
+          }
           console.log(`[GPS] ${id} | ${describePacket(dec)}`);
         }
       } catch (e) {
