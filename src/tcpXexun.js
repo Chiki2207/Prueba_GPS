@@ -1,22 +1,6 @@
 import net from "node:net";
 import { decodePacket, splitPackets, hasTrustworthyGps } from "./xexunDecoder.js";
 
-const TZ_CO = "America/Bogota";
-
-/** Misma hora de wall-clock en Colombia (epoch → texto legible, sin tocar el dato en la trama). */
-function formatHoraColombia(date) {
-  return date.toLocaleString("es-CO", {
-    timeZone: TZ_CO,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-}
-
 /**
  * Rastreadores Xexun (PO2, etc.): muchos hablan por TCP con tramas 0xFA 0xAF, no por HTTP.
  * Documentación: el servidor a veces debe responder 1 byte (p. ej. 0x00) al recibir;
@@ -27,6 +11,25 @@ function chunkHex(buf, max = 128) {
   return s.length > max * 2 ? `${s.slice(0, max * 2)}…` : s;
 }
 
+const TZ_CO = "America/Bogota";
+const coLocaleOpts = { timeZone: TZ_CO, dateStyle: "short", timeStyle: "medium" };
+
+function nowColombiaString() {
+  return new Date().toLocaleString("es-CO", coLocaleOpts);
+}
+
+/** Hora del reloj del rastreador (viene en UTC en timestampISO) mostrada en Colombia. */
+function deviceTimeColombiaString(dec) {
+  let ms = NaN;
+  if (typeof dec.timestamp === "number" && Number.isFinite(dec.timestamp)) {
+    ms = dec.timestamp * 1000;
+  } else if (dec.timestampISO) {
+    ms = Date.parse(dec.timestampISO);
+  }
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toLocaleString("es-CO", coLocaleOpts);
+}
+
 function describePacket(dec) {
   const parts = [
     `imei=${dec.imei}`,
@@ -34,9 +37,12 @@ function describePacket(dec) {
     `seq=${dec.seq}`,
     `len=${dec.lengthPayload ?? dec.length}`,
   ];
+  parts.push(`recibidoCO=${nowColombiaString()}`);
   if (dec.parseError) parts.push(`parse=${dec.parseError}`);
   if (dec.gpsRejected) parts.push(`GPS=${dec.gpsRejected}`);
   if (dec.timestampISO) parts.push(`ts=${dec.timestampISO}`);
+  const tsCo = deviceTimeColombiaString(dec);
+  if (tsCo) parts.push(`tsCO=${tsCo} (${TZ_CO})`);
   if (dec.rssi != null) parts.push(`rssi=${dec.rssi}`);
   if (dec.battery != null) {
     const b = dec.battery > 100 ? `${dec.battery}(raw)` : `${dec.battery}%`;
@@ -66,13 +72,6 @@ function describePacket(dec) {
   } else {
     parts.push("sin coordenadas en trama (revisar máscara / tipo de dato)");
   }
-  if (dec.timestampISO) {
-    const d = new Date(dec.timestampISO);
-    if (!Number.isNaN(d.getTime()) && d.getFullYear() > 2000) {
-      parts.push(`msg_CO=${formatHoraColombia(d)}`);
-    }
-  }
-  parts.push(`rec_CO=${formatHoraColombia(new Date())}`);
   return parts.join(" | ");
 }
 
