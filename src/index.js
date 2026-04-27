@@ -2,8 +2,16 @@ import http from "node:http";
 import express from "express";
 import morgan from "morgan";
 import { tryParseXexunText } from "./parseGprmc.js";
+import { startXexunTcpServer } from "./tcpXexun.js";
 
 const PORT = Number(process.env.PORT) || 5002;
+/** TCP para protocolo Xexun binario (FA AF). 0 = desactivado. Por defecto 5003 (el 5002 queda libre para HTTP). */
+const TCP_PORT = (() => {
+  const t = process.env.TCP_PORT;
+  if (t === "0" || t === "") return 0;
+  return t != null && t !== "" ? Number(t) : 5003;
+})();
+const tcpSendAck = process.env.XEXUN_TCP_ACK !== "0";
 const app = express();
 
 app.use(morgan("dev"));
@@ -107,7 +115,13 @@ app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // Salud
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "gps-receiver", port: PORT });
+  res.json({
+    ok: true,
+    service: "gps-receiver",
+    port: PORT,
+    http: PORT,
+    tcpXexun: TCP_PORT > 0 ? TCP_PORT : null,
+  });
 });
 
 // Pruebas: JSON { latitude, longitude } o { lat, lng }
@@ -142,18 +156,32 @@ app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
+if (TCP_PORT > 0 && TCP_PORT === PORT) {
+  console.error(
+    "Error: HTTP (PORT) y TCP (TCP_PORT) no pueden ser el mismo número. Usa p. ej. PORT=5001 TCP_PORT=5002 o deja PORT=5002 TCP_PORT=5003",
+  );
+  process.exit(1);
+}
+
+if (TCP_PORT > 0) {
+  startXexunTcpServer(TCP_PORT, { sendAck: tcpSendAck });
+} else {
+  console.log("[TCP-Xexun] desactivado (TCP_PORT=0)");
+}
+
 const server = http.createServer(app);
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GPS receiver escuchando en http://0.0.0.0:${PORT}`);
-  console.log("  GET  /health        — estado");
+  console.log(`GPS receiver HTTP en http://0.0.0.0:${PORT}`);
+  if (TCP_PORT > 0) {
+    console.log(
+      `  Rastreador Xexun (binario): en "Cambiar IP" usa IP:puerto → :${TCP_PORT} (abre ${TCP_PORT}/tcp en ufw)`,
+    );
+  }
+  console.log("  GET  /health        — estado (incluye puerto TCP si aplica)");
   console.log("  POST /api/position  — JSON { latitude, longitude } o { lat, lng }");
   console.log("  POST /xexun         — cuerpo crudo (GPRMC / Xexun texto)");
   console.log("  POST /              — reenvío típico Xexun (IP:puerto sin ruta)");
   console.log("  GET|POST /ingest    — query + cuerpo (mismo parser)");
-  console.log(
-    "Nota Xexun PO2: muchos usan protocolo binario TCP (0xFAAF), no HTTP. Apunta IP:puerto TCP o usa Traccar si no hay modo URL/HTTP en el menú del equipo.",
-  );
-  console.log(
-    "Configuración: en el rastreador (SMS o app) fija APN, servidor = IP pública o dominio del VPS, puerto 5002, ruta/servidor según el manual (URL http://IP:5002/xexun si el dispositivo admite reporte por HTTP).",
-  );
+  console.log("HTTP y TCP son servicios distintos: 5002 = web; Xexun PO2 (FA AF) usa TCP en el puerto indicado (por defecto 5003).");
+  console.log("Opcional: XEXUN_TCP_ACK=0 desactiva la respuesta 0x00 al rastreador por TCP.");
 });
