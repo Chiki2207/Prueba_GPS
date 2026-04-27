@@ -77,7 +77,14 @@ export function startXexunTcpServer(port, options = {}) {
           const dec = decodePacket(p);
           if (!dec) continue;
           if (dec.cells?.length) lastLbsCells = dec.cells;
-          if (!hasTrustworthyGps(dec) && lastLbsCells?.length) {
+          // Solo si esta trama no trae LBS propia (p. ej. paquetes 94 con GPS basura):
+          // no usar fallback cuando ya hay cells — evita el mensaje engañoso "trama previa"
+          // en los dos primeros paquetes LBS de 55 bytes.
+          if (
+            !hasTrustworthyGps(dec) &&
+            lastLbsCells?.length &&
+            !dec.cells?.length
+          ) {
             dec.fallbackCells = lastLbsCells;
           }
           console.log(`[GPS] ${id} | ${describePacket(dec)}`);
