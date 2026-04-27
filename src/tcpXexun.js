@@ -12,13 +12,39 @@ function chunkHex(buf, max = 128) {
 }
 
 function describePacket(dec) {
-  const coords =
-    dec.lat != null && dec.lon != null
-      ? `lat=${dec.lat.toFixed(6)} lon=${dec.lon.toFixed(6)}`
-      : "sin coordenadas válidas en este paquete";
-  return (
-    `imei=${dec.imei} | msg=${dec.msgIdHex} | seq=${dec.seq} | length=${dec.length} | ${coords}`
-  );
+  const parts = [
+    `imei=${dec.imei}`,
+    `msg=${dec.msgIdHex}`,
+    `seq=${dec.seq}`,
+    `len=${dec.lengthPayload ?? dec.length}`,
+  ];
+  if (dec.parseError) parts.push(`parse=${dec.parseError}`);
+  if (dec.timestampISO) parts.push(`ts=${dec.timestampISO}`);
+  if (dec.rssi != null) parts.push(`rssi=${dec.rssi}`);
+  if (dec.battery != null) {
+    const b = dec.battery > 100 ? `${dec.battery}(raw)` : `${dec.battery}%`;
+    parts.push(`bat=${b}${dec.charging ? " cargando" : ""}`);
+  }
+  if (dec.satellites != null) parts.push(`sats=${dec.satellites}`);
+  if (dec.speedKmh != null) parts.push(`vel=${dec.speedKmh.toFixed(1)}km/h`);
+  if (dec.courseDeg != null) parts.push(`rumbo=${dec.courseDeg.toFixed(1)}°`);
+  if (dec.altitudeM != null) parts.push(`alt=${dec.altitudeM.toFixed(0)}m`);
+  if (dec.lat != null && dec.lon != null) {
+    parts.push(`lat=${dec.lat.toFixed(6)} lon=${dec.lon.toFixed(6)}`);
+    if (dec.valid === false) parts.push("fix=no");
+  } else if (dec.cells?.length) {
+    const c = dec.cells[0];
+    parts.push(
+      `LBS MCC=${c.mcc} MNC=${c.mnc} LAC=${c.lac} CID=${c.cid} (sin lat/lon en trama; torre GSM)`,
+    );
+  } else if (dec.wifi?.length) {
+    parts.push(`WiFi APs=${dec.wifi.length} (sin lat/lon en trama)`);
+  } else if ((dec.lengthPayload ?? dec.length) === 12) {
+    parts.push("heartbeat (sin posición)");
+  } else {
+    parts.push("sin coordenadas en trama (revisar máscara / tipo de dato)");
+  }
+  return parts.join(" | ");
 }
 
 export function startXexunTcpServer(port, options = {}) {

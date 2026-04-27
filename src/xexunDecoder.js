@@ -1,12 +1,10 @@
 /**
- * Decodificador "best-effort" del protocolo Xexun nuevo (PO2):
- *   FA AF | msgId(2) | seq(2) | IMEI(8 BCD) | length(2) | crc(2) | payload(length) | FA AF
+ * Decodificador del protocolo Xexun2 (PO2, FA AF), alineado con Traccar
+ * `Xexun2ProtocolDecoder.java`:
+ *   FA AF | msgId(2) | seq(2) | IMEI(8 BCD) | length(2) & 0x3ff | crc(2) | payload | FA AF
  *
- * El protocolo binario completo (0x14 position) define muchos sub-paquetes.
- * Aquí se extraen los campos comunes (IMEI, msgId, seq, length) y, cuando el
- * payload tiene tamaño suficiente, se intenta sacar lat/lon como dos doubles
- * big-endian en offsets habituales (degrees * 100). Si la lectura no encaja
- * con el rango terrestre, se devuelve sin coordenadas.
+ * Payload 0x0014: N grupos; cada grupo = cabecera + máscaras + GPS/LBS/WiFi…
+ * Coordenadas: float o double en formato NMEA empaquetado (convertCoordinate).
  */
 
 function bcdImeiToString(bytes) {
@@ -20,37 +18,258 @@ function bcdImeiToString(bytes) {
   return s;
 }
 
-function isPlausibleLatLon(lat, lon) {
-  return (
-    Number.isFinite(lat) &&
-    Number.isFinite(lon) &&
-    lat >= -90 &&
-    lat <= 90 &&
-    lon >= -180 &&
-    lon <= 180 &&
-    !(lat === 0 && lon === 0)
-  );
+/** NMEA-like: grados enteros = trunc(value/100), minutos = resto → decimal ° */
+function convertCoordinate(value) {
+  const degrees = Math.trunc(value / 100);
+  const minutes = value - degrees * 100;
+  return degrees + minutes / 60;
 }
 
-function tryDecodeCoords(payload) {
-  const tries = [];
-  // 1) doubles big-endian a offsets 18 (lon) y 26 (lat) – degrees*100
-  if (payload.length >= 34) {
-    const lonRaw = payload.readDoubleBE(18);
-    const latRaw = payload.readDoubleBE(26);
-    tries.push({ off: "18/26 BE /100", lat: latRaw / 100, lon: lonRaw / 100 });
-    tries.push({ off: "18/26 BE", lat: latRaw, lon: lonRaw });
+function bitCheck(mask, bit) {
+  return (mask & (1 << bit)) !== 0;
+}
+
+/**
+ * Lee un bloque de posición (un elemento del array `lengths` del PDF / Traccar).
+ * @param {Buffer} buf
+ * @param {number} start
+ * @param {number} endIndex
+ */
+function readPositionGroup(buf, start, endIndex) {
+  let o = start;
+  /** @type {Record<string, unknown>} */
+  const out = { valid: false };
+
+  if (o + 10 > endIndex) {
+    out.partial = true;
+    return out;
   }
-  // 2) Variante invertida (lat primero)
-  if (payload.length >= 34) {
-    const latRaw = payload.readDoubleBE(18);
-    const lonRaw = payload.readDoubleBE(26);
-    tries.push({ off: "18/26 BE swap /100", lat: latRaw / 100, lon: lonRaw / 100 });
+
+  out.packetIndex = buf.readUInt8(o++);
+  const unix = buf.readUInt32BE(o);
+  o += 4;
+  out.timestamp = unix;
+  if (unix > 946684800 && unix < 4000000000) {
+    out.timestampISO = new Date(unix * 1000).toISOString();
   }
-  for (const t of tries) {
-    if (isPlausibleLatLon(t.lat, t.lon)) return t;
+
+  out.rssi = buf.readUInt8(o++);
+  const battWord = buf.readUInt16BE(o);
+  o += 2;
+  out.charging = (battWord & 0x8000) !== 0;
+  out.battery = battWord & 0x7fff;
+
+  const mask = buf.readUInt8(o++);
+  out.maskHex = `0x${mask.toString(16).padStart(2, "0")}`;
+
+  if (bitCheck(mask, 0)) {
+    if (o + 4 > endIndex) return out;
+    out.alarmFlags = buf.readUInt32BE(o);
+    o += 4;
   }
-  return null;
+
+  if (bitCheck(mask, 1)) {
+    if (o + 1 > endIndex) return out;
+    const positionMask = buf.readUInt8(o++);
+    out.positionMaskHex = `0x${positionMask.toString(16).padStart(2, "0")}`;
+
+    if (bitCheck(positionMask, 0)) {
+      if (o + 1 + 4 + 4 > endIndex) return out;
+      out.valid = true;
+      out.satellites = buf.readUInt8(o++);
+      out.lon = convertCoordinate(buf.readFloatBE(o));
+      o += 4;
+      out.lat = convertCoordinate(buf.readFloatBE(o));
+      o += 4;
+    }
+
+    if (bitCheck(positionMask, 1)) {
+      if (o + 1 > endIndex) return out;
+      const wifiCount = buf.readUInt8(o++);
+      out.wifi = [];
+      for (let j = 0; j < wifiCount; j++) {
+        if (o + 7 > endIndex) break;
+        out.wifi.push({
+          mac: buf.subarray(o, o + 6).toString("hex"),
+          rssi: buf.readInt8(o + 6),
+        });
+        o += 7;
+      }
+    }
+
+    if (bitCheck(positionMask, 2)) {
+      if (o + 1 > endIndex) return out;
+      const cellCount = buf.readUInt8(o++);
+      out.cells = [];
+      for (let j = 0; j < cellCount; j++) {
+        if (o + 13 > endIndex) break;
+        out.cells.push({
+          mcc: buf.readUInt16BE(o),
+          mnc: buf.readUInt16BE(o + 2),
+          lac: buf.readInt32BE(o + 4),
+          cid: buf.readUInt32BE(o + 8),
+          signal: buf.readInt8(o + 12),
+        });
+        o += 13;
+      }
+    }
+
+    if (bitCheck(positionMask, 3)) {
+      if (o + 1 > endIndex) return out;
+      const tofN = buf.readUInt8(o++);
+      o += 12 * tofN;
+    }
+
+    if (bitCheck(positionMask, 5)) {
+      if (o + 4 > endIndex) return out;
+      out.speedKmh = buf.readUInt16BE(o) * 0.1;
+      o += 2;
+      out.courseDeg = buf.readUInt16BE(o) * 0.1;
+      o += 2;
+    }
+
+    if (bitCheck(positionMask, 6)) {
+      if (o + 1 + 8 + 8 > endIndex) return out;
+      out.valid = true;
+      out.satellites = buf.readUInt8(o++);
+      out.lon = convertCoordinate(buf.readDoubleBE(o));
+      o += 8;
+      out.lat = convertCoordinate(buf.readDoubleBE(o));
+      o += 8;
+    }
+
+    if (bitCheck(positionMask, 7)) {
+      if (o + 2 > endIndex) return out;
+      const dataLength = buf.readUInt16BE(o);
+      o += 2;
+      if (dataLength > 0) {
+        if (o + 1 + 2 > endIndex) return out;
+        const dataType = buf.readUInt8(o++);
+        const innerLen = buf.readUInt16BE(o);
+        o += 2;
+        const dataEnd = o + innerLen;
+        if (dataType === 0x47 /* 'G' */ && dataEnd <= endIndex) {
+          if (o + 8 + 8 + 1 + 1 + 1 + 2 + 2 + 4 <= dataEnd) {
+            out.lon = convertCoordinate(buf.readDoubleBE(o));
+            o += 8;
+            out.lat = convertCoordinate(buf.readDoubleBE(o));
+            o += 8;
+            out.valid = buf.readUInt8(o++) > 0;
+            out.satellites = buf.readUInt8(o++);
+            buf.readUInt8(o++); // SNR
+            out.speedKmh = buf.readUInt16BE(o) * 0.1;
+            o += 2;
+            out.courseDeg = buf.readUInt16BE(o) * 0.1;
+            o += 2;
+            out.altitudeM = buf.readFloatBE(o);
+            o += 4;
+          }
+        }
+        o = dataEnd;
+      }
+    }
+  }
+
+  if (bitCheck(mask, 3)) {
+    if (o + 4 > endIndex) return out;
+    out.fingerprint = buf.readUInt32BE(o);
+    o += 4;
+  }
+  if (bitCheck(mask, 4)) {
+    if (o + 38 > endIndex) return out;
+    o += 20 + 8 + 10;
+  }
+  if (bitCheck(mask, 5)) {
+    if (o + 12 > endIndex) return out;
+    o += 12;
+  }
+
+  if (o < endIndex) {
+    out.tailHex = buf.subarray(o, endIndex).toString("hex");
+    o = endIndex;
+  }
+
+  return out;
+}
+
+/**
+ * @param {Buffer} payload
+ * @returns {{ groups: Record<string, unknown>[]; parseError?: string }}
+ */
+export function parseXexun2PositionPayload(payload) {
+  const result = { groups: [] };
+  if (payload.length < 3) return result;
+
+  let o = 0;
+  const count = payload.readUInt8(o++);
+  if (count === 0 || count > 32) {
+    result.parseError = "bad_group_count";
+    return result;
+  }
+
+  const lengths = [];
+  for (let i = 0; i < count; i++) {
+    if (o + 2 > payload.length) {
+      result.parseError = "truncated_lengths";
+      return result;
+    }
+    lengths.push(payload.readUInt16BE(o));
+    o += 2;
+  }
+
+  for (let gi = 0; gi < count; gi++) {
+    const endIndex = o + lengths[gi];
+    if (endIndex > payload.length) {
+      result.parseError = "truncated_group";
+      result.groups.push({ groupIndex: gi, error: "overflow" });
+      break;
+    }
+    result.groups.push(readPositionGroup(payload, o, endIndex));
+    o = endIndex;
+  }
+
+  return result;
+}
+
+function mergeGroupsForLog(groups) {
+  /** @type {Record<string, unknown>} */
+  const m = {};
+  let lat;
+  let lon;
+  let valid = false;
+  for (const g of groups) {
+    if (g.lat != null && g.lon != null && Number.isFinite(g.lat) && Number.isFinite(g.lon)) {
+      lat = g.lat;
+      lon = g.lon;
+      valid = !!g.valid;
+    }
+    if (m.timestampISO == null && g.timestampISO) m.timestampISO = g.timestampISO;
+    if (m.battery == null && g.battery != null) m.battery = g.battery;
+    if (m.charging == null && g.charging != null) m.charging = g.charging;
+    if (m.rssi == null && g.rssi != null) m.rssi = g.rssi;
+    if (m.cells == null && g.cells?.length) m.cells = g.cells;
+    if (m.wifi == null && g.wifi?.length) m.wifi = g.wifi;
+    if (m.speedKmh == null && g.speedKmh != null) m.speedKmh = g.speedKmh;
+    if (m.courseDeg == null && g.courseDeg != null) m.courseDeg = g.courseDeg;
+    if (m.altitudeM == null && g.altitudeM != null) m.altitudeM = g.altitudeM;
+    if (m.satellites == null && g.satellites != null) m.satellites = g.satellites;
+  }
+  if (lat != null) {
+    m.lat = lat;
+    m.lon = lon;
+    m.valid = valid;
+  }
+  return m;
+}
+
+function tryDecodePosition(payload) {
+  const parsed = parseXexun2PositionPayload(payload);
+  const merged = mergeGroupsForLog(parsed.groups);
+  return {
+    ...merged,
+    positionGroups: parsed.groups.length,
+    parseError: parsed.parseError,
+  };
 }
 
 export function decodePacket(buf) {
@@ -61,7 +280,8 @@ export function decodePacket(buf) {
   const msgId = buf.readUInt16BE(2);
   const seq = buf.readUInt16BE(4);
   const imei = bcdImeiToString(buf.subarray(6, 14));
-  const length = buf.readUInt16BE(14);
+  const rawLength = buf.readUInt16BE(14);
+  const length = rawLength & 0x03ff;
   const crc = buf.readUInt16BE(16);
   const payload = buf.subarray(18, 18 + length);
 
@@ -70,19 +290,15 @@ export function decodePacket(buf) {
     msgIdHex: `0x${msgId.toString(16).padStart(4, "0")}`,
     seq,
     imei,
-    length,
+    length: rawLength,
+    lengthPayload: length,
     crc,
     payloadLength: payload.length,
     payloadHex: payload.toString("hex"),
   };
 
-  if (msgId === 0x14 && payload.length >= 34) {
-    const c = tryDecodeCoords(payload);
-    if (c) {
-      out.lat = c.lat;
-      out.lon = c.lon;
-      out.coordsSource = c.off;
-    }
+  if (msgId === 0x14) {
+    Object.assign(out, tryDecodePosition(payload));
   }
 
   return out;
@@ -102,7 +318,8 @@ export function splitPackets(buf) {
       continue;
     }
     if (i + 16 > buf.length) break;
-    const length = buf.readUInt16BE(i + 14);
+    const rawLen = buf.readUInt16BE(i + 14);
+    const length = rawLen & 0x03ff;
     const totalLen = 18 + length + 2;
     if (i + totalLen > buf.length) break;
     if (
