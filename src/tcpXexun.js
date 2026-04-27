@@ -18,16 +18,26 @@ function nowColombiaString() {
   return new Date().toLocaleString("es-CO", coLocaleOpts);
 }
 
-/** Hora del reloj del rastreador (viene en UTC en timestampISO) mostrada en Colombia. */
-function deviceTimeColombiaString(dec) {
-  let ms = NaN;
+function deviceTimestampMs(dec) {
   if (typeof dec.timestamp === "number" && Number.isFinite(dec.timestamp)) {
-    ms = dec.timestamp * 1000;
-  } else if (dec.timestampISO) {
-    ms = Date.parse(dec.timestampISO);
+    return dec.timestamp * 1000;
   }
-  if (Number.isNaN(ms)) return null;
-  return new Date(ms).toLocaleString("es-CO", coLocaleOpts);
+  if (dec.timestampISO) {
+    const t = Date.parse(dec.timestampISO);
+    return Number.isNaN(t) ? NaN : t;
+  }
+  return NaN;
+}
+
+/**
+ * Aviso si el instante del punto GPS es claramente anterior a la llegada (cola/reenvío en el rastreador).
+ */
+function colaAproximadaHint(deviceMs) {
+  if (Number.isNaN(deviceMs)) return null;
+  const sec = (Date.now() - deviceMs) / 1000;
+  if (sec < 90) return null;
+  if (sec < 3600) return `~${Math.round(sec / 60)}m más antiguo que llegóCO`;
+  return `~${(sec / 3600).toFixed(1)}h más antiguo que llegóCO`;
 }
 
 function describePacket(dec) {
@@ -37,12 +47,22 @@ function describePacket(dec) {
     `seq=${dec.seq}`,
     `len=${dec.lengthPayload ?? dec.length}`,
   ];
-  parts.push(`recibidoCO=${nowColombiaString()}`);
+  // llegóCO = ahora (Colombia) al escribir el log = cuándo le llegó al VPS (la que te cuadra con "ahora")
+  // puntoGpsCO = hora del registro DENTRO de la trama; suele ser anterior si el equipo reenvía cola
+  parts.push(`llegóCO=${nowColombiaString()}`);
   if (dec.parseError) parts.push(`parse=${dec.parseError}`);
   if (dec.gpsRejected) parts.push(`GPS=${dec.gpsRejected}`);
-  if (dec.timestampISO) parts.push(`ts=${dec.timestampISO}`);
-  const tsCo = deviceTimeColombiaString(dec);
-  if (tsCo) parts.push(`tsCO=${tsCo} (${TZ_CO})`);
+  if (dec.timestampISO) parts.push(`tsUTC=${dec.timestampISO}`);
+  const devMs = deviceTimestampMs(dec);
+  if (!Number.isNaN(devMs)) {
+    const puntoGpsCo = new Date(devMs).toLocaleString("es-CO", coLocaleOpts);
+    const cola = colaAproximadaHint(devMs);
+    parts.push(
+      cola
+        ? `puntoGpsCO=${puntoGpsCo} | ${cola}`
+        : `puntoGpsCO=${puntoGpsCo}`,
+    );
+  }
   if (dec.rssi != null) parts.push(`rssi=${dec.rssi}`);
   if (dec.battery != null) {
     const b = dec.battery > 100 ? `${dec.battery}(raw)` : `${dec.battery}%`;
