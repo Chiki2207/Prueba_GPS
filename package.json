@@ -1,0 +1,18 @@
+{
+  "name": "gps-receiver",
+  "version": "1.0.0",
+  "description": "Backend Node para recibir coordenadas GPS (Xexun PO2 y pruebas HTTP)",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "morgan": "^1.10.0"
+  }
+}
