@@ -26,7 +26,7 @@ function tryParseBuffer(buf) {
   const s = asUtf8String(buf);
   if (!s) return { kind: "empty", value: s };
   const t = s.trim();
-  if (t.startsWith("{") || t.startsWith("[")) {
+  if (t.startsWith("{") || t.startsWith("[")) {es
     try {
       return { kind: "json", value: JSON.parse(s) };
     } catch {
