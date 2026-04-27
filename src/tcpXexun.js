@@ -16,9 +16,11 @@ export function startXexunTcpServer(port, options = {}) {
 
   const server = net.createServer((socket) => {
     const id = `${socket.remoteAddress ?? "?"}:${socket.remotePort ?? "?"}`;
+    let totalBytes = 0;
     console.log(`[TCP-Xexun] conexión ${id}`);
 
     socket.on("data", (chunk) => {
+      totalBytes += chunk.length;
       const len = chunk.length;
       const head = len >= 2 && chunk[0] === 0xfa && chunk[1] === 0xaf;
       console.log(
@@ -37,7 +39,13 @@ export function startXexunTcpServer(port, options = {}) {
       console.error(`[TCP-Xexun] error socket ${id}:`, e.message);
     });
     socket.on("close", () => {
-      console.log(`[TCP-Xexun] cierre ${id}`);
+      if (totalBytes === 0) {
+        console.log(
+          `[TCP-Xexun] cierre ${id} | sin datos (0 bytes) — suele ser sondeo de red o cliente que no mandó carga; no es todavía una trama del GPS`,
+        );
+      } else {
+        console.log(`[TCP-Xexun] cierre ${id} | total recibido ${totalBytes} bytes`);
+      }
     });
   });
 
